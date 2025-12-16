@@ -32,9 +32,23 @@ pip install requests
 
 ### 1. 基础鉴权
 
+你需要获取个人的登录凭证（Token）才能让脚本代表你访问接口。
+
+**获取步骤 (简易版)：**
+
+1.  **登录官网**：
+    请在电脑浏览器中访问 PU口袋校园网页版：https://class.pocketuni.net/#/home 并完成登录。
+2.  **查找凭证**：
+    * **方法 A (浏览器 F12)**：按 `F12` 打开开发者工具，切换到 **Network (网络)** 标签页。刷新页面，点击任意一个名称以 `api` 开头的请求，在右侧 **Request Headers (请求头)** 中找到 `Authorization` 字段。
+    * **方法 B (抓包软件)**：自行安装 Fiddler、Charles 或其他抓包软件，捕获登录后的 HTTP 请求头。
+3.  **复制 Token**：
+    找到字样为 `Bearer xxxxx...` 的长字符串（例如 `Bearer er45616e5fb1eb6541865er1brg5vdv5d:4865165151515`）。
+4.  **配置脚本**：
+    将复制的完整字符串覆盖到下方代码中。
+
 ```python
-# 抓包获取你的 Authorization 字段
-AUTHORIZATION = "Bearer your_token_here" 
+# 抓包获取你的 Authorization 字段 (必须包含 Bearer 前缀)
+AUTHORIZATION = "Bearer er45616e5fb1eb6541865er1brg5vdv5d:4865165151515"
 ```
 
 ### 2. 筛选规则 (必需修改)
