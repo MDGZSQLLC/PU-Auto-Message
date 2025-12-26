@@ -57,10 +57,11 @@ if not os.path.exists(_dir):
         print(f"❌ 创建目录失败: {e}")
 
 # 消息推送接口 (发送 Base64 编码的 Markdown)
+# 留空表示不使用推送接口
 DIFF_LOG_URL = "http://127.0.0.1/message.php"
 
 # ==============================================================================
-#  此功能暂未实现，这段代码请忽略设置!!!!     5. 调度与时间策略 (Scheduling & Timing)
+# 5. 调度与时间策略 (Scheduling & Timing)
 # ==============================================================================
 # 全量数据刷新间隔 (秒) -> 30分钟
 REFRESH_INTERVAL_SEC = 1800
@@ -104,6 +105,7 @@ REQUIRED_FIELDS = [
 # 初始化全局 Session (复用 TCP 连接)
 _session = requests.Session()
 _session.headers.update(HEADERS)
+
 
 def log(message):
     """简易日志输出"""
@@ -345,7 +347,7 @@ def filter_effective_activities(all_activities: List[Dict[str, Any]],ended_activ
         # (可选双重保障) 排除状态名直接显示为“已结束/已完结”的
         # 虽然通过ID减法已经处理了，但防止漏网之鱼
         status_name = item.get("statusName", "")
-        if status_name in ["已结束", "已完结","完结待审核"]:
+        if status_name in ["已结束", "已完结","完结待审核","完结被驳回"]:
             continue
 
         # 排除 ID 为空的数据
@@ -383,7 +385,7 @@ def fetch_valid_tribe_activities(tribe_list: List[Dict[str, Any]]) -> List[Dict[
     valid_tribe_events = []
 
     # 定义无效状态集合
-    INVALID_STATUS = ["已结束", "已完结","完结待审核"]
+    INVALID_STATUS = ["已结束", "已完结","完结待审核","完结被驳回"]
 
     for tribe in tribe_list:
         tid = tribe.get("id")
@@ -531,7 +533,6 @@ def fetch_and_clean_data(activity_list: List[Dict], filter_tribe_limit: bool = T
     log(f"✨ 清洗报告: 输入{total} -> 社团剔除{skipped_tribe} -> 学院剔除{skipped_college} -> 年级剔除{skipped_year} -> 输出{len(cleaned_data_list)}")
     return cleaned_data_list
 
-
 def fetch_target_activities_by_mode(enable_tribe: bool = False,enable_public: bool = False) -> Tuple[List[Dict], List[Dict]]:
     """
     按需调度中心：根据开关获取社团或公共活动
@@ -553,10 +554,10 @@ def fetch_target_activities_by_mode(enable_tribe: bool = False,enable_public: bo
 
         # 2. 获取社团内部列表
         raw_tribe_activities = fetch_valid_tribe_activities(my_tribes)
-        
+
         # 3. 关键词过滤 (在请求详情前执行，节省流量)
         raw_tribe_activities = filter_by_keywords(raw_tribe_activities)
-        
+
         # 4. 深度清洗 (filter_tribe_limit=False, 保留社团限制)
         if raw_tribe_activities:
             final_tribe_data = fetch_and_clean_data(raw_tribe_activities, filter_tribe_limit=False)
@@ -577,10 +578,10 @@ def fetch_target_activities_by_mode(enable_tribe: bool = False,enable_public: bo
 
         # 3. 初步清洗 (剔除已结束)
         effective_global = filter_effective_activities(raw_global_list, raw_ended_list)
-        
+
          # 4. 关键词过滤
         effective_global = filter_by_keywords(effective_global)
-        
+
         # 5. 深度清洗 (filter_tribe_limit=True, 剔除有社团限制的活动)
         # 注意：这里不需要再做"集合减法"，因为 fetch_and_clean_data 内部会检查 allowTribe。
         # 如果一个活动在全局列表里，但它是社团专属，filter_tribe_limit=True 会把它过滤掉。
@@ -638,17 +639,48 @@ def _get_days_diff(start_str: Any, end_str: Any) -> float:
             return 0
     return (_to_ts(end_str) - _to_ts(start_str)) / 86400.0
 def _is_large_public_activity(activity: Dict[str, Any]) -> bool:
-    """判断是否为【大型公共活动】"""
+    """
+    判断是否为【大型公共活动】(最终修正版)
+    
+    判定逻辑 (满足任意一项即为 True):
+    1. [人数维度] 名义容量 > 200
+    2. [人数维度] 实际已报名 > 200 (防止名义容量乱填)
+    3. [时间维度] 活动持续时间 > 30天
+    4. [时间维度] 报名持续时间 > 30天
+    """
+    # === 1. 定义阈值 (根据你的要求调整) ===
+    CAPACITY_LIMIT = 200        # 人数门槛 (你定义的 200人)
+    DURATION_LIMIT_DAYS = 30    # 时间门槛 (长期活动防骚扰)
+
+    # === 2. 安全获取数据 ===
     try:
+        # 名义容量 (allowUserCount)
         capacity = int(activity.get("allowUserCount", 0))
     except:
         capacity = 0
-    if capacity <= LARGE_ACT_CAPACITY_LIMIT:
-        return False
+    
+    try:
+        # 当前实际报名人数 (joinUserCount)
+        # 关键修正：很多活动 capacity 写 0 或 -1，但实际有几千人，必须判读这个字段
+        current_joined = int(activity.get("joinUserCount", 0))
+    except:
+        current_joined = 0
+
+    # === 3. [核心判定 A]：人数维度 (使用 OR 逻辑) ===
+    # 只要名义容量或者实际人数超过 200，直接判定为大型活动，立即限流
+    if capacity > CAPACITY_LIMIT or current_joined > CAPACITY_LIMIT:
+        return True
+
+    # === 4. [核心判定 B]：时间维度 ===
+    # 如果人数没超标，但挂在上面的时间太长（比如那种挂一学期的长期招募），也视为大型活动以免每天重复推
     act_days = _get_days_diff(activity.get("startTime"), activity.get("endTime"))
     join_days = _get_days_diff(activity.get("joinStartTime"), activity.get("joinEndTime"))
-    return (act_days > LARGE_ACT_DURATION_DAYS) or (join_days > LARGE_ACT_DURATION_DAYS)
+    
+    if (act_days > DURATION_LIMIT_DAYS) or (join_days > DURATION_LIMIT_DAYS):
+        return True
 
+    # === 5. 都不满足，才是普通活动 ===
+    return False
 def format_activity_markdown(a: Dict[str, Any], show_detail: bool = True) -> str:
     """
     构建 Markdown 格式的活动信息
@@ -659,7 +691,7 @@ def format_activity_markdown(a: Dict[str, Any], show_detail: bool = True) -> str
     # --- 1. 基础信息构建 ---
     name = a.get("name", "无标题")
     source = f"【{a.get('_source_type', '活动')}】" if a.get('_source_type') else ""
-    title_line = f"### {source}{name}"
+    title_line = f"***{source}{name}***\n"
 
     # 报名人数信息
     join_info = f"上限 {a.get('allowUserCount', '-')} | 已报名 {a.get('joinUserCount', '-')} | 已签到 {a.get('signInUserCount', '-')}"
@@ -670,11 +702,11 @@ def format_activity_markdown(a: Dict[str, Any], show_detail: bool = True) -> str
     # --- 2. 简略模式 ---
     if not show_detail:
         desc_raw = a.get('description') or ""
-        short_desc = desc_raw[:10] + "......" if desc_raw else "无介绍......"
+        short_desc = desc_raw[:18] + "......" if desc_raw else "无介绍......"
 
         return (
             f"{title_line}\n"
-            f"> {short_desc}\n"
+            f"*介绍：*{short_desc}\n\n"
             f"*报名人数：* {join_info}\n"
             f"*学分 / PU银豆：* {credit_info}"
         )
@@ -714,7 +746,7 @@ def format_activity_markdown(a: Dict[str, Any], show_detail: bool = True) -> str
     # --- 4. 详细输出 (严格按照指定格式) ---
     detailed_md = (
         f"{title_line}\n"
-        f"{a.get('description', '无详细介绍')}\n\n"
+        f"*活动介绍：*{a.get('description', '无详细介绍')}\n\n"
         f"*报名时间：* {_format_date_mmddhm(a.get('joinStartTime'))} ~ {_format_date_mmddhm(a.get('joinEndTime'))}\n"
         f"*报名人数：* {join_info}\n"
         f"*活动时间：* {_format_date_mmddhm(a.get('startTime'))} ~ {_format_date_mmddhm(a.get('endTime'))}\n"
@@ -810,6 +842,7 @@ def process_public_activities(new_public_list: List[Dict],old_public_data: Dict[
 
         # --- 判断活动类型 ---
         is_large = _is_large_public_activity(act)
+        is_large = True
 
         # --- 准备新的状态变量 (默认继承旧值) ---
         new_detail_count = detail_count
@@ -859,7 +892,7 @@ def process_public_activities(new_public_list: List[Dict],old_public_data: Dict[
         # --- 生成消息 ---
         if should_notify:
             # 统一的消息头
-            header = f"🔥 **火热报名中 (新增 +{notify_num}人)**"
+            header = f"🔥 ***火热报名中 (新增 +{notify_num}人)***"
 
             # 调用 Markdown 生成函数 (根据 show_detail 决定繁简)
             md = format_activity_markdown(act, show_detail=show_detail)
@@ -951,10 +984,7 @@ if __name__ == "__main__":
 
         # ---------------- Step 3: 按需请求数据 ----------------
         # 只请求需要执行的部分，减少封号风险
-        new_tribe_acts, new_public_acts = fetch_target_activities_by_mode(
-            enable_tribe=do_run_tribe,
-            enable_public=do_run_public
-        )
+        new_tribe_acts, new_public_acts = fetch_target_activities_by_mode(enable_tribe=do_run_tribe,enable_public=do_run_public)
 
         # 准备收集的消息列表 (这是要发给客户端的干货)
         all_messages = []
